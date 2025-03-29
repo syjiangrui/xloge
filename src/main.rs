@@ -30,28 +30,31 @@ const MAGIC_END: u8 = 0x00; // End marker for log entries
 const BASE_XOR_KEY: u8 = 0xCC;
 
 // --- Error Handling ---
-#[derive(Error, Debug)]
+#[derive(Debug, Error)]
 enum DecodeError {
-    #[error("I/O Error: {0}")]
-    Io(#[from] io::Error), // Handles file I/O, byteorder reads, zstd, flate2 reads
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 
-    #[error("Glob Error: {0}")]
-    Glob(#[from] glob::GlobError),
+    #[error("Invalid log header: {0}")]
+    HeaderValidation(String),
 
-    #[error("Glob Pattern Error: {0}")]
-    GlobPattern(#[from] glob::PatternError),
+    #[error("Decompression failed: {0}")]
+    Decompression(String),
 
-    #[error("Decompression Error: {0}")]
-    Decompression(io::Error), // Specific variant for flate2/zstd failures during decode
+    #[error("Invalid log data: {0}")]
+    LogData(String),
 
-    #[error("Invalid Data: {0}")]
-    InvalidData(String),
+    #[error("Invalid file format: {0}")]
+    Format(String),
 
-    #[error("Log entry sequence not found or file empty")]
+    #[error("Unsupported format: {0:#04x}")]
+    UnsupportedFormat(u8),
+
+    #[error("End of valid data reached")]
     NotFound,
 
-    #[error("Unsupported format/magic byte: {0:#04x}")]
-    UnsupportedFormat(u8),
+    #[error("Invalid data: {0}")]
+    InvalidData(String),
 }
 
 // --- Helper Functions ---
@@ -477,7 +480,7 @@ fn decode_buffer(
                 // Use map_err to convert io::Error to DecodeError::Decompression
                 decoder.read_to_end(&mut decompressed)
                     .map(|_| decompressed) // On success, return the decompressed Vec
-                    .map_err(DecodeError::Decompression)
+                    .map_err(|e| DecodeError::Decompression(e.to_string()))
             }
         }
         // --- Raw Deflate (Encryption Skipped) ---
@@ -488,7 +491,7 @@ fn decode_buffer(
                 let mut decompressed = Vec::with_capacity(data_ready.len() * 3);
                 decoder.read_to_end(&mut decompressed)
                     .map(|_| decompressed)
-                    .map_err(DecodeError::Decompression)
+                    .map_err(|e| DecodeError::Decompression(e.to_string()))
             }
         }
 
@@ -496,14 +499,14 @@ fn decode_buffer(
         MAGIC_ASYNC_NO_CRYPT_ZSTD_START  /* 0x0D */ |
         MAGIC_SYNC_NO_CRYPT_ZSTD_START   /* 0x0B */ => {
              zstd::decode_all(data_ready.as_slice())
-                .map_err(DecodeError::Decompression)
+                .map_err(|e| DecodeError::Decompression(e.to_string()))
         }
         // --- Zstd (Encryption Skipped) ---
         MAGIC_SYNC_ZSTD_START            /* 0x0A */ |
          MAGIC_ASYNC_ZSTD_START          /* 0x0C */ => {
             log::warn!("Entry at offset {} (seq {} magic {:#04x}) requires ECDH/TEA decryption (unsupported). Attempting ZSTD on potentially encrypted data.", current_offset, seq, magic_start);
              zstd::decode_all(data_ready.as_slice())
-                .map_err(DecodeError::Decompression)
+                .map_err(|e| DecodeError::Decompression(e.to_string()))
          }
 
         // Should not happen if get_crypt_key_len worked earlier
@@ -537,152 +540,148 @@ fn decode_buffer(
     Ok(next_entry_offset)
 }
 
-/// Parses a single xlog file, decodes its entries, and writes the output to a corresponding .log file.
-fn parse_file(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
-    log::info!("Processing file: {:?}", input_path.display());
-    let buffer = match fs::read(input_path) {
-        Ok(b) => b,
-        Err(e) => {
-            log::error!(
-                "Failed to read input file {:?}: {}",
-                input_path.display(),
-                e
-            );
-            return Err(e.into()); // Convert io::Error to DecodeError::Io
+// 添加一个处理单个文件的帮助函数，用于减少代码重复
+fn process_single_file(
+    input_path: &Path,
+    output_path: &Path,
+    final_result: &mut Result<(), Box<dyn std::error::Error>>,
+) {
+    if let Err(e) = parse_file(input_path, output_path) {
+        log::error!("Error processing {}: {}", input_path.display(), e);
+        if final_result.is_ok() {
+            *final_result = Err(format!("Failed on {}: {}", input_path.display(), e).into());
         }
-    };
+    }
+}
+
+// 添加一个处理目录中所有xlog文件的帮助函数
+fn process_directory(
+    dir_path: &Path,
+    final_result: &mut Result<(), Box<dyn std::error::Error>>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let pattern = dir_path.join("*.xlog");
+    let pattern_str = pattern
+        .to_str()
+        .ok_or_else(|| "Invalid input directory path encoding.".to_string())?;
+
+    log::info!("Searching for files matching: {}", pattern_str);
+    let mut files_found = false;
+
+    for entry in glob(pattern_str)? {
+        match entry {
+            Ok(xlog_path) => {
+                if xlog_path.is_file() {
+                    files_found = true;
+                    let mut log_path = xlog_path.clone();
+                    log_path.set_extension("log");
+                    log::debug!(
+                        "Processing {:?} -> {:?}",
+                        xlog_path.display(),
+                        log_path.display()
+                    );
+                    process_single_file(&xlog_path, &log_path, final_result);
+                }
+            }
+            Err(e) => {
+                log::error!("Error accessing file during glob search: {}", e);
+                if final_result.is_ok() {
+                    *final_result = Err(e.into());
+                }
+            }
+        }
+    }
+
+    Ok(files_found)
+}
+
+// 优化后的parse_file函数
+fn parse_file(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
+    log::info!(
+        "Decoding {:?} to {:?}",
+        input_path.display(),
+        output_path.display()
+    );
+
+    // 读取xlog文件内容
+    let buffer = fs::read(input_path).map_err(DecodeError::Io)?;
 
     if buffer.is_empty() {
-        log::warn!("Input file is empty: {:?}", input_path.display());
-        // Create empty output file to match behavior, propagate potential IO error
-        File::create(output_path)?;
+        log::warn!("Skipping empty file: {:?}", input_path.display());
         return Ok(());
     }
 
-    // --- Find Initial Reliable Starting Point ---
-    // Prefer finding 2 consecutive valid headers to increase confidence against false positives.
-    let initial_offset = match find_log_start_pos(&buffer, 2) {
-        Some(offset) => {
-            log::debug!(
-                "Found initial offset {} validated by 2 consecutive entries.",
-                offset
-            );
-            offset
-        }
-        None => {
-            // Fallback: Try finding just 1 valid header. Might be less reliable.
-            log::warn!("Could not find 2 consecutive valid entries. Trying to find just 1.");
-            match find_log_start_pos(&buffer, 1) {
-                Some(offset) => {
-                    log::warn!("Found initial start offset {} validated by only 1 entry. Proceeding cautiously.", offset);
-                    offset
-                }
-                None => {
-                    // If even one valid header cannot be found, the file is likely unusable.
-                    log::error!(
-                        "No valid log entries found in file: {:?}",
-                        input_path.display()
-                    );
-                    // Create an empty output file, but return error upstream.
-                    File::create(output_path)?;
-                    return Err(DecodeError::NotFound);
-                }
-            }
-        }
-    };
+    // 寻找有效日志的起始位置
+    let start_offset = find_log_start_pos(&buffer, 3).ok_or_else(|| {
+        DecodeError::Format(format!(
+            "Could not find valid log entries in {:?}",
+            input_path
+        ))
+    })?;
 
-    // Log if we skipped initial bytes
-    if initial_offset > 0 {
-        log::warn!(
-            "First valid log entry starts at offset {}. Skipping initial {} bytes.",
-            initial_offset,
-            initial_offset
+    if start_offset > 0 {
+        log::debug!(
+            "Skipped {} bytes before finding valid log entries",
+            start_offset
         );
-    } else {
-        log::info!("First valid log entry starts at offset 0.");
     }
 
-    // --- Decoding Loop ---
-    let mut out_buffer: Vec<u8> = Vec::new(); // Buffer for decoded output content
-    let mut last_seq: u16 = 0; // Track sequence numbers for gap detection
-    let mut current_offset = initial_offset;
+    // 解码日志内容
+    let mut out_buffer = Vec::with_capacity(buffer.len() * 2); // 预分配足够空间，避免频繁重新分配
+    let mut offset = start_offset;
+    let mut last_seq = 0u16;
 
-    loop {
-        // Check if we've processed past the end of the buffer
-        if current_offset >= buffer.len() {
-            log::debug!(
-                "Reached or passed end of buffer at offset {}.",
-                current_offset
-            );
-            break;
-        }
-
-        match decode_buffer(&buffer, current_offset, &mut out_buffer, &mut last_seq) {
+    while offset < buffer.len() {
+        match decode_buffer(&buffer, offset, &mut out_buffer, &mut last_seq) {
             Ok(next_offset) => {
-                // Sanity check: Ensure decode_buffer always returns an offset > current
-                if next_offset <= current_offset {
-                    log::error!("Decode loop stalled: next_offset ({}) <= current_offset ({}). Aborting file processing.", next_offset, current_offset);
-                    out_buffer.extend_from_slice(
-                        b"[!] decode_log_file: Decode loop stalled. Aborting.\n",
-                    );
-                    break; // Prevent infinite loop
-                }
-                current_offset = next_offset; // Advance to the next entry
-            }
-            Err(DecodeError::NotFound) => {
-                log::info!("Finished processing log entries near offset {}. No more valid entries found or required skipping.", current_offset);
-                break; // Normal exit condition when end of valid data reached
+                offset = next_offset;
             }
             Err(e) => {
-                // Catch unexpected errors during the loop itself (should be rare)
-                log::error!(
-                    "Unexpected error during decoding loop near offset {}: {}. Aborting file.",
-                    current_offset,
-                    e
-                );
-                let err_msg = format!("[!] decode_log_file: Unexpected error: {}. Aborting.\n", e);
-                out_buffer.extend_from_slice(err_msg.as_bytes());
-                break; // Exit loop on unexpected issues
+                // 出错时尝试恢复，寻找下一个有效的日志开始位置
+                log::warn!("Decode error at offset {}: {}", offset, e);
+                match find_log_start_pos(&buffer[offset.min(buffer.len() - 1)..], 2) {
+                    Some(new_rel_offset) => {
+                        let new_offset = offset + new_rel_offset;
+                        log::debug!(
+                            "Found next valid log section at offset {} (skipped {} bytes)",
+                            new_offset,
+                            new_rel_offset
+                        );
+                        offset = new_offset;
+                    }
+                    None => {
+                        log::debug!("No more valid log entries found after offset {}", offset);
+                        break;
+                    }
+                }
             }
         }
-    } // End loop
+    }
 
-    // --- Write Output ---
-    if out_buffer.is_empty() && initial_offset == 0 && buffer.len() > 0 {
-        // Log if the file wasn't empty, started at 0, but produced no output (or only error lines).
+    // 检查是否成功解码了内容
+    if out_buffer.is_empty() {
         log::warn!(
             "Processing completed, but no log content was successfully decoded for: {:?}",
             input_path.display()
         );
     } else {
         log::info!(
-            "Writing decoded log content to: {:?}",
+            "Writing decoded log content ({} bytes) to: {:?}",
+            out_buffer.len(),
             output_path.display()
         );
     }
 
-    match File::create(output_path) {
-        Ok(mut file) => {
-            if let Err(e) = file.write_all(&out_buffer) {
-                log::error!(
-                    "Failed to write output file {:?}: {}",
-                    output_path.display(),
-                    e
-                );
-                return Err(e.into());
-            }
-        }
-        Err(e) => {
-            log::error!(
-                "Failed to create output file {:?}: {}",
-                output_path.display(),
-                e
-            );
-            return Err(e.into());
+    // 确保输出目录存在
+    if let Some(parent) = output_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(DecodeError::Io)?;
         }
     }
 
-    Ok(()) // Successfully processed this file
+    // 写入输出文件
+    fs::write(output_path, &out_buffer).map_err(DecodeError::Io)?;
+
+    Ok(())
 }
 
 // --- Command Line Interface ---
@@ -706,15 +705,14 @@ struct Cli {
 
 // --- Main Execution ---
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging (reads RUST_LOG environment variable, defaults to info level)
+    // 初始化日志（读取RUST_LOG环境变量，默认为info级别）
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
-    let mut final_result: Result<(), Box<dyn std::error::Error>> = Ok(()); // Track overall success/failure
+    let mut final_result: Result<(), Box<dyn std::error::Error>> = Ok(());
 
-    // --- Argument Processing Logic ---
-    match (cli.input, cli.output) {
-        // === Case 1: Specific Input File and Output File ===
+    match (cli.input.as_ref(), cli.output.as_ref()) {
+        // 情况1: 指定输入文件和输出文件
         (Some(input_path), Some(output_path)) => {
             if input_path.is_dir() {
                 return Err(
@@ -724,66 +722,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if output_path.is_dir() {
                 return Err("Output path cannot be a directory.".into());
             }
-            // Ensure output directory exists
+
+            // 确保输出目录存在
             if let Some(parent) = output_path.parent() {
                 if !parent.exists() {
                     fs::create_dir_all(parent)?;
                     log::info!("Created output directory: {:?}", parent.display());
                 }
             }
-            // Process the single file
-            if let Err(e) = parse_file(&input_path, &output_path) {
-                log::error!("Error processing {}: {}", input_path.display(), e);
-                // Keep the specific error for return
-                final_result = Err(format!("Failed on {}: {}", input_path.display(), e).into());
-            }
+
+            process_single_file(input_path, output_path, &mut final_result);
         }
 
-        // === Case 2: Specific Input (File or Directory), Default Output ===
+        // 情况2: 指定输入（文件或目录），默认输出
         (Some(input_path), None) => {
             if input_path.is_dir() {
-                // Process all *.xlog files in the input directory
-                let pattern = input_path.join("*.xlog");
-                let pattern_str = pattern
-                    .to_str()
-                    .ok_or("Invalid input directory path encoding.")?;
-                log::info!("Searching for files matching: {}", pattern_str);
-                let mut files_found = false;
+                // 处理输入目录中所有的.xlog文件
+                let files_found = process_directory(input_path, &mut final_result)?;
 
-                for entry in glob(pattern_str)? {
-                    match entry {
-                        Ok(xlog_path) => {
-                            if xlog_path.is_file() {
-                                files_found = true;
-                                let mut log_path = xlog_path.clone();
-                                log_path.set_extension("log"); // Output alongside input
-                                log::debug!(
-                                    "Processing {:?} -> {:?}",
-                                    xlog_path.display(),
-                                    log_path.display()
-                                );
-                                if let Err(e) = parse_file(&xlog_path, &log_path) {
-                                    log::error!("Error processing {}: {}", xlog_path.display(), e);
-                                    // Keep the first error encountered
-                                    if final_result.is_ok() {
-                                        final_result = Err(format!(
-                                            "Failed on {}: {}",
-                                            xlog_path.display(),
-                                            e
-                                        )
-                                        .into());
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Error accessing file during glob search: {}", e);
-                            if final_result.is_ok() {
-                                final_result = Err(e.into());
-                            }
-                        }
-                    }
-                } // End glob loop
                 if !files_found {
                     log::warn!(
                         "No .xlog files found in directory: {:?}",
@@ -791,75 +747,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             } else {
-                // Input is a single file with default output name
+                // 输入是单个文件，使用默认输出名称
                 if !input_path.exists() {
                     return Err(format!("Input file not found: {}", input_path.display()).into());
                 }
                 let mut log_path = input_path.clone();
-                log_path.set_extension("log"); // Output alongside input
-                if let Err(e) = parse_file(&input_path, &log_path) {
-                    log::error!("Error processing {}: {}", input_path.display(), e);
-                    final_result = Err(format!("Failed on {}: {}", input_path.display(), e).into());
-                }
+                log_path.set_extension("log"); // 输出到输入旁边
+                process_single_file(input_path, &log_path, &mut final_result);
             }
         }
 
-        // === Case 3: No Input Specified (Use Current Directory), Default Output ===
+        // 情况3: 未指定输入（使用当前目录），默认输出
         (None, None) => {
-            let pattern = "*.xlog";
-            log::info!(
-                "No input specified. Searching for '{}' in current directory.",
-                pattern
-            );
-            let mut files_found = false;
+            let current_dir = std::env::current_dir()?;
+            log::info!("No input specified. Searching for '*.xlog' in current directory.");
 
-            for entry in glob(pattern)? {
-                match entry {
-                    Ok(xlog_path) => {
-                        if xlog_path.is_file() {
-                            files_found = true;
-                            let mut log_path = xlog_path.clone();
-                            log_path.set_extension("log");
-                            log::debug!(
-                                "Found: {:?}, outputting to {:?}",
-                                xlog_path.display(),
-                                log_path.display()
-                            );
-                            if let Err(e) = parse_file(&xlog_path, &log_path) {
-                                log::error!("Error processing {}: {}", xlog_path.display(), e);
-                                if final_result.is_ok() {
-                                    final_result =
-                                        Err(format!("Failed on {}: {}", xlog_path.display(), e)
-                                            .into());
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log::error!("Error accessing file during glob search: {}", e);
-                        if final_result.is_ok() {
-                            final_result = Err(e.into());
-                        }
-                    }
-                }
-            } // End glob loop
+            let files_found = process_directory(&current_dir, &mut final_result)?;
+
             if !files_found {
-                log::warn!("No .xlog files found in current directory.");
+                log::warn!("No .xlog files found in current directory");
             }
         }
 
-        // === Case 4: No Input, Specific Output (Invalid Combination) ===
+        // 情况4: 未指定输入但指定了输出（无效情况）
         (None, Some(_)) => {
-            return Err("Output path specified without an input path.".into());
+            return Err("Cannot specify output file without specifying input file.".into());
         }
-    } // End match cli args
-
-    // --- Final Status Report ---
-    if final_result.is_ok() {
-        log::info!("Processing finished successfully.");
-    } else {
-        log::error!("Processing finished with errors. See logs above.");
-        // Error is already in final_result, just return it to indicate failure
     }
+
     final_result
 }

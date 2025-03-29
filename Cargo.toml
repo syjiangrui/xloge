@@ -2,6 +2,8 @@
 name = "xloge"
 version = "0.1.0"
 edition = "2021"
+authors = ["Reik Jiang"]
+description = "A utility for decoding WeChat .xlog files"
 
 [dependencies]
 byteorder = "1.5" # For reading binary data (like struct.unpack)
@@ -16,6 +18,6 @@ log = "0.4" # For logging
 env_logger = "0.10" # For logging
 
 [profile.release]
-lto = true
-opt-level = "z"
-codegen-units = 1
+lto = true        # 启用链接时优化
+opt-level = 3     # 最大优化级别
+codegen-units = 1 # 较少的代码生成单元以提高优化
