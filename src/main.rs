@@ -1,4 +1,4 @@
-#![allow(clippy::collapsible_else_if)] // Keep if you prefer this style
+#![allow(clippy::collapsible_else_if)]
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use clap::Parser;
@@ -12,49 +12,44 @@ use thiserror::Error; // Error derivation
 
 // --- Magic Numbers (Log Entry Types) ---
 const MAGIC_NO_COMPRESS_START: u8 = 0x03; // XOR
-const MAGIC_NO_COMPRESS_START1: u8 = 0x06; // Uncompressed (Sync Zlib header in C name was misleading)
+const MAGIC_NO_COMPRESS_START1: u8 = 0x06; // Uncompressed
 const MAGIC_NO_COMPRESS_NO_CRYPT_START: u8 = 0x08; // Uncompressed
 const MAGIC_COMPRESS_START: u8 = 0x04; // XOR + Raw Deflate
 const MAGIC_COMPRESS_START1: u8 = 0x05; // Chunked + XOR + Raw Deflate
-const MAGIC_COMPRESS_START2: u8 = 0x07; // Async + Encrypted (ECDH/TEA) + Raw Deflate
-const MAGIC_COMPRESS_NO_CRYPT_START: u8 = 0x09; // Async + Raw Deflate
+const MAGIC_COMPRESS_START2: u8 = 0x07; // Needs ECDH/TEA + Raw Deflate
+const MAGIC_COMPRESS_NO_CRYPT_START: u8 = 0x09; // Raw Deflate
 
-const MAGIC_SYNC_ZSTD_START: u8 = 0x0A; // Sync + Encrypted (ECDH/TEA) + Zstd
-const MAGIC_SYNC_NO_CRYPT_ZSTD_START: u8 = 0x0B; // Sync + Zstd
-const MAGIC_ASYNC_ZSTD_START: u8 = 0x0C; // Async + Encrypted (ECDH/TEA) + Zstd
-const MAGIC_ASYNC_NO_CRYPT_ZSTD_START: u8 = 0x0D; // Async + Zstd
+const MAGIC_SYNC_ZSTD_START: u8 = 0x0A; // Needs ECDH/TEA + Zstd
+const MAGIC_SYNC_NO_CRYPT_ZSTD_START: u8 = 0x0B; // Zstd
+const MAGIC_ASYNC_ZSTD_START: u8 = 0x0C; // Needs ECDH/TEA + Zstd
+const MAGIC_ASYNC_NO_CRYPT_ZSTD_START: u8 = 0x0D; // Zstd
 
 const MAGIC_END: u8 = 0x00; // End marker for log entries
-
-// C code used simpler XOR based on this
-const BASE_XOR_KEY: u8 = 0xCC;
+const BASE_XOR_KEY: u8 = 0xCC; // Key Modifier for simple XOR
 
 // --- Error Handling ---
-#[derive(Debug, Error)]
+#[derive(Error, Debug)]
 enum DecodeError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("I/O Error: {0}")]
+    Io(#[from] io::Error), // File I/O, byteorder, zstd/flate2 reads
 
-    #[error("Invalid log header: {0}")]
-    HeaderValidation(String),
+    #[error("Glob Error: {0}")]
+    Glob(#[from] glob::GlobError),
 
-    #[error("Decompression failed: {0}")]
-    Decompression(String),
+    #[error("Glob Pattern Error: {0}")]
+    GlobPattern(#[from] glob::PatternError),
 
-    #[error("Invalid log data: {0}")]
-    LogData(String),
+    #[error("Decompression Error: {0}")]
+    Decompression(#[source] io::Error), // Specific variant for flate2/zstd failures
 
-    #[error("Invalid file format: {0}")]
-    Format(String),
+    #[error("Invalid Data: {0}")]
+    InvalidData(String), // Structural issues, bad lengths, failed XOR/chunking
 
-    #[error("Unsupported format: {0:#04x}")]
-    UnsupportedFormat(u8),
-
-    #[error("End of valid data reached")]
+    #[error("Log entry sequence not found or file empty")]
     NotFound,
 
-    #[error("Invalid data: {0}")]
-    InvalidData(String),
+    #[error("Unsupported format/magic byte: {0:#04x}")]
+    UnsupportedFormat(u8),
 }
 
 // --- Helper Functions ---
@@ -71,21 +66,19 @@ fn get_crypt_key_len(magic_start: u8) -> Option<usize> {
         | MAGIC_SYNC_NO_CRYPT_ZSTD_START
         | MAGIC_ASYNC_ZSTD_START
         | MAGIC_ASYNC_NO_CRYPT_ZSTD_START => Some(64),
-        _ => None, // Unknown/Unsupported magic byte
+        _ => None,
     }
 }
 
 /// Checks if a structurally valid log entry starts at the given offset.
 /// Validates magic byte, header presence, length field, and end marker boundary.
-/// Does *not* perform decompression or validate content.
-///
 /// Returns `Ok(next_entry_offset)` on structural validity, `Err(reason)` otherwise.
 fn check_log_header(buffer: &[u8], offset: usize) -> Result<usize, String> {
-    if offset >= buffer.len() {
-        return Err("Offset reaches end of buffer".to_string());
+    let buffer_len = buffer.len();
+    if offset >= buffer_len {
+        return Err("Offset is outside buffer bounds".to_string());
     }
 
-    // Check magic byte and determine crypt key length
     let magic_start = buffer[offset];
     let crypt_key_len = get_crypt_key_len(magic_start).ok_or_else(|| {
         format!(
@@ -94,686 +87,639 @@ fn check_log_header(buffer: &[u8], offset: usize) -> Result<usize, String> {
         )
     })?;
 
-    // Minimum header length calculation (common fields + crypt key)
     // Structure: magic(1) + seq(2) + begin_hour(1) + end_hour(1) + data_length(4) + crypt_key(N)
     let header_len = 1 + 2 + 1 + 1 + 4 + crypt_key_len;
 
-    // Check if buffer is long enough for the calculated header
-    if offset
+    let header_end_offset = offset
         .checked_add(header_len)
-        .map_or(true, |end| end > buffer.len())
-    // Checks overflow or if end > buffer.len()
-    {
+        .ok_or("Integer overflow calculating header end offset")?;
+    if header_end_offset > buffer_len {
         return Err(format!(
-            "Buffer too small for header. Need {} bytes from offset {}, have {} total bytes.",
+            "Buffer too small for header (needs {} bytes, have {})",
             header_len,
-            offset,
-            buffer.len()
+            buffer_len - offset
         ));
     }
 
-    // Read data length field (u32 LE) safely
-    let length_field_offset = offset + 1 + 2 + 1 + 1; // Offset to the 4-byte length field
-    let data_length = match buffer.get(length_field_offset..length_field_offset + 4) {
-        Some(slice) => match Cursor::new(slice).read_u32::<LittleEndian>() {
-            Ok(l) => l as usize,
-            Err(e) => return Err(format!("Failed to read length field: {}", e)),
-        },
-        None => unreachable!("Buffer length check should have caught this"), // Should be impossible
-    };
+    let length_field_offset = offset + 1 + 2 + 1 + 1;
+    let data_length = Cursor::new(&buffer[length_field_offset..length_field_offset + 4])
+        .read_u32::<LittleEndian>()
+        .map_err(|e| format!("Failed to read data length field: {}", e))?
+        as usize;
 
-    // --- Safe offset calculations using checked_add ---
-    let data_start_offset = offset + header_len;
-
-    let data_end_offset = match data_start_offset.checked_add(data_length) {
-        Some(val) => val,
-        None => {
-            return Err(format!(
-            "Overflow calculating data end offset (start={} + length={}). Corrupt length field?",
+    let data_start_offset = header_end_offset; // Data starts immediately after header
+    let data_end_offset = data_start_offset.checked_add(data_length).ok_or_else(|| {
+        format!(
+            "Integer overflow calculating data end offset (start={}, len={})",
             data_start_offset, data_length
-        ))
-        }
-    };
+        )
+    })?;
+    let magic_end_offset = data_end_offset; // MAGIC_END is immediately after data
 
-    // MAGIC_END byte is immediately after the data block
-    let magic_end_offset = data_end_offset;
+    let next_entry_offset = magic_end_offset
+        .checked_add(1)
+        .ok_or("Integer overflow calculating next entry offset")?;
 
-    // The next entry starts right after the MAGIC_END byte
-    let next_entry_offset = match magic_end_offset.checked_add(1) {
-        Some(val) => val,
-        None => {
-            return Err("Overflow calculating next entry offset. Corrupt length field?".to_string())
-        }
-    };
-
-    // Check if the calculated end marker offset is within buffer bounds
-    if magic_end_offset >= buffer.len() {
-        return Err(format!(
-            "Calculated MAGIC_END offset {} is out of bounds (buffer len {}). Corrupt length or truncated entry. Off={}, HdrLen={}, DataLen={}",
-            magic_end_offset, buffer.len(), offset, header_len, data_length
-        ));
+    if magic_end_offset >= buffer_len {
+        return Err(format!("Calculated MAGIC_END offset {} out of bounds (len {}). Corrupt length/truncated. Off={}, HdrLen={}, DataLen={}", magic_end_offset, buffer_len, offset, header_len, data_length));
     }
 
-    // Verify the actual byte value at the expected end marker position
     let magic_end_actual = buffer[magic_end_offset];
     if magic_end_actual != MAGIC_END {
         return Err(format!(
-            "Expected MAGIC_END ({:#04x}) at offset {}, found {:#04x}. Corrupt data or length field.",
+            "Expected MAGIC_END ({:#04x}) at offset {}, found {:#04x}.",
             MAGIC_END, magic_end_offset, magic_end_actual
         ));
     }
 
-    // All structural checks passed.
     Ok(next_entry_offset)
 }
 
-// Define a minimum plausible size for a valid entry to optimize search start.
-// Uses the largest possible header size (64-byte key) + 1 data byte + end byte.
-const MIN_ENTRY_SIZE: usize = 1 + 2 + 1 + 1 + 4 + 64 + 1 + 1;
+const MIN_ENTRY_SIZE: usize = 1 + 2 + 1 + 1 + 4 + 64 + 1 + 1; // Max header + data(1) + end_magic(1)
 
 /// Tries to find the starting offset of the first sequence of `count` structurally valid log entries.
-/// Used to find the initial entry or to skip over corrupted data.
 fn find_log_start_pos(buffer: &[u8], count: u32) -> Option<usize> {
     if count == 0 || buffer.len() < MIN_ENTRY_SIZE {
-        log::debug!("find_log_start_pos: Invalid params or buffer too small.");
         return None;
     }
-
-    // Avoid searching too close to the end where 'count' entries cannot possibly fit.
     let search_limit = buffer.len().saturating_sub(MIN_ENTRY_SIZE);
-
     log::debug!(
-        "find_log_start_pos(count={}): Searching buffer (size {}) up to offset {}.",
+        "find_log_start_pos(count={}): Searching up to offset {}.",
         count,
-        buffer.len(),
         search_limit
     );
 
     'outer: for start_offset in 0..=search_limit {
-        // Quick check: Is it a potentially valid magic byte?
         if get_crypt_key_len(buffer[start_offset]).is_none() {
-            continue; // Skip if not a known magic start byte
+            continue;
         }
-
         log::trace!("find_log_start_pos: Potential start at {}", start_offset);
-
-        // Check if `count` valid entries follow consecutively from here
         let mut current_offset = start_offset;
         for i in 0..count {
             match check_log_header(buffer, current_offset) {
                 Ok(next_offset) => {
-                    // This check ensures forward progress, preventing infinite loops on corrupt data.
                     if next_offset <= current_offset {
-                        log::error!("Logic error: next_offset ({}) <= current_offset ({}) from check_log_header at offset {}. Aborting check for start {}.", next_offset, current_offset, current_offset, start_offset);
-                        continue 'outer; // Invalid sequence, try next start_offset
+                        log::error!("Logic error: check_log_header({}) returned non-progressing offset {}. Aborting search for start {}.", current_offset, next_offset, start_offset);
+                        continue 'outer;
                     }
-
                     log::trace!(
                         "find_log_start_pos: Check {} Ok. Offset {} -> Next {}",
                         i,
                         current_offset,
                         next_offset
                     );
-                    current_offset = next_offset; // Advance to where the next entry should start
-
-                    // If this was the last check needed in the sequence, we found it.
+                    current_offset = next_offset;
                     if i == count - 1 {
-                        log::debug!("find_log_start_pos: Found sequence of {} valid entries starting at {}. Final next_offset={}", count, start_offset, current_offset);
-                        return Some(start_offset); // Success!
+                        log::debug!(
+                            "find_log_start_pos: Success. Found {} entries starting at {}.",
+                            count,
+                            start_offset
+                        );
+                        return Some(start_offset);
+                    }
+                    // Optimization: if next offset is already past buffer end, no point continuing inner loop
+                    if current_offset >= buffer.len() && i < count - 1 {
+                        log::trace!("find_log_start_pos: Next offset {} reached buffer end prematurely. Aborting check for start {}.", current_offset, start_offset);
+                        continue 'outer;
                     }
                 }
                 Err(ref reason) => {
-                    // Found an invalid entry in the sequence.
-                    log::trace!("find_log_start_pos: Check {} failed at offset {}: '{}'. Aborting check for start {}.", i, current_offset, reason, start_offset);
-                    continue 'outer; // Invalid sequence, try next start_offset
+                    log::trace!("find_log_start_pos: Check {} failed at {}: '{}'. Aborting check for start {}.", i, current_offset, reason, start_offset);
+                    continue 'outer;
                 }
             }
-            // Boundary check: Ensure the next offset to check is still within the buffer
-            // (or exactly at the end, which is fine for the loop check).
-            if current_offset > buffer.len() {
-                log::trace!("find_log_start_pos: Next offset {} exceeds buffer length {}. Aborting check for start {}.", current_offset, buffer.len(), start_offset);
-                continue 'outer; // Cannot check further, sequence invalid.
-            }
         }
-        // This point should only be reached if count is 0, which is handled at the start.
     }
-
     log::debug!(
         "find_log_start_pos(count={}): No valid sequence found.",
         count
     );
-    None // No sequence of `count` valid entries found
+    None
 }
 
-/// Decodes a single log entry starting at `offset`, handling potential corruption and different formats.
-/// Appends decoded data to `out_buffer`. Updates `last_seq`.
-/// Returns the offset of the *next* entry or an Error.
-fn decode_buffer(
+/// Decodes a single log entry, handling data preparation (XOR/chunking) and decompression.
+/// Appends decoded data or error messages to `out_buffer`.
+/// Returns `Ok(next_entry_offset)` even if decoding failed, to allow skipping.
+/// Returns `Err(DecodeError::NotFound)` only if the initial offset is invalid or end of file reached prematurely.
+fn decode_single_entry(
     buffer: &[u8],
     offset: usize,
     out_buffer: &mut Vec<u8>,
     last_seq: &mut u16,
 ) -> Result<usize, DecodeError> {
-    if offset >= buffer.len() {
-        return Err(DecodeError::NotFound); // Base case: trying to read past end
-    }
-
-    // --- Attempt to Validate Header / Skip Corrupted Data ---
-    let mut current_offset = offset;
-    if let Err(header_err) = check_log_header(buffer, current_offset) {
-        log::warn!(
-            "Header check failed at offset {}: '{}'. Attempting to find next valid entry.",
-            current_offset,
-            header_err
-        );
-        // Try to find the start of the *next* valid entry
-        let search_start = current_offset + 1;
-        if search_start >= buffer.len() {
-            log::error!(
-                "Header check failed near end of buffer (offset {}), no more data to search.",
-                current_offset
+    // Validate header structure first. If this fails, we might try to find the next one.
+    let (header_len, seq, length, magic_start) = match validate_and_parse_header(buffer, offset) {
+        Ok(header_info) => header_info,
+        Err(e) => {
+            // If header validation fails at the current offset, try finding the next valid one.
+            log::warn!(
+                "Header check failed at offset {}: '{}'. Searching for next valid entry.",
+                offset,
+                e
             );
-            return Err(DecodeError::NotFound); // No more data left
+            return find_next_valid_entry_start(buffer, offset, out_buffer)
+                .map_err(|_| DecodeError::NotFound); // If find fails, treat as NotFound
         }
-
-        match find_log_start_pos(&buffer[search_start..], 1) {
-            Some(fix_pos_relative) => {
-                // Found a potentially valid entry after the corruption
-                let fix_pos_absolute = search_start + fix_pos_relative;
-                let skipped_bytes = fix_pos_absolute - current_offset;
-                let warning = format!(
-                    "[!] decode_log_file: Skipped {} bytes of potentially corrupt data starting at offset {}. Original Header Error: {}\n", // Use [!] for user-visible warnings
-                    skipped_bytes, current_offset, header_err
-                );
-                out_buffer.extend_from_slice(warning.as_bytes());
-                log::warn!("{}", warning.trim_end()); // Log without extra newline
-                current_offset = fix_pos_absolute; // Jump to the found position
-            }
-            None => {
-                // Corruption occurred, and no further valid entries were found
-                let warning = format!(
-                    "[!] decode_log_file: Header error at offset {} ('{}') and no subsequent valid entries found. Processing stopped.\n",
-                    current_offset, header_err
-                );
-                out_buffer.extend_from_slice(warning.as_bytes());
-                log::error!("{}", warning.trim_end());
-                return Err(DecodeError::NotFound); // Indicate end of usable data
-            }
-        }
-    }
-
-    // --- Re-check offset bounds after potential jump ---
-    if current_offset >= buffer.len() {
-        log::debug!("Reached end of buffer after skipping corruption.");
-        return Err(DecodeError::NotFound);
-    }
-
-    // --- Read Validated Header Fields ---
-    let magic_start = buffer[current_offset];
-    // crypt_key_len should always be Some here, as check_log_header/find_log_start_pos succeeded
-    let crypt_key_len = get_crypt_key_len(magic_start).ok_or_else(|| {
-        // This should be unreachable if check_log_header passed
-        DecodeError::InvalidData(format!(
-            "Internal logic error: Validated header has unknown magic {:#04x} at offset {}",
-            magic_start, current_offset
-        ))
-    })?;
-
-    let header_len = 1 + 2 + 1 + 1 + 4 + crypt_key_len;
-    // Basic header bounds check (defense in depth)
-    if current_offset + header_len > buffer.len() {
-        return Err(DecodeError::InvalidData(format!(
-            "Validated header length {} exceeds buffer size {} at offset {}",
-            header_len,
-            buffer.len(),
-            current_offset
-        )));
-    }
-
-    // Use cursor for safe reading from the offset guaranteed by check_log_header
-    let mut header_cursor = Cursor::new(&buffer[current_offset..current_offset + header_len]);
-    header_cursor.set_position(1); // Skip magic byte
-
-    let seq = header_cursor.read_u16::<LittleEndian>()?;
-    let _begin_hour = header_cursor.read_u8()?; // Field exists but often unused
-    let _end_hour = header_cursor.read_u8()?; // Field exists but often unused
-    let length = header_cursor.read_u32::<LittleEndian>()? as usize; // Data block length
+    };
 
     log::debug!(
         "Processing entry: offset={}, magic={:#04x}, seq={}, data_len={}",
-        current_offset,
+        offset,
         magic_start,
         seq,
         length
     );
 
     // --- Sequence Gap Check ---
-    // seq=0 is often a special marker (e.g., start info), seq=1 is first real log
-    if seq > 1 && *last_seq != 0 && seq != (*last_seq + 1) {
-        let expected_seq = *last_seq + 1;
-        let missing_range_end = seq.saturating_sub(1); // Avoid underflow if seq is 1
-        let warning = format!(
-                 "[!] decode_log_file: Log sequence gap detected. Expected {}, got {}. Range {}-{} missing.\n",
-                 expected_seq, seq, expected_seq, missing_range_end
-             );
-        out_buffer.extend_from_slice(warning.as_bytes());
-        log::warn!("{}", warning.trim_end());
-    }
-    // Update last sequence number seen (skip seq=0)
-    if seq != 0 {
-        *last_seq = seq;
-    }
+    check_sequence_gap(seq, last_seq, out_buffer);
 
-    // --- Extract Data Slice ---
-    let data_start_offset = current_offset + header_len;
-    let data_end_offset = data_start_offset + length;
-    // Final check that data slice is within bounds (should be guaranteed by check_log_header)
-    if data_end_offset > buffer.len() {
-        return Err(DecodeError::InvalidData(format!("Data range [{}:{}) exceeds buffer bounds (len {}) for entry at offset {}. File truncated?", data_start_offset, data_end_offset, buffer.len(), current_offset)));
-    }
-    let original_data_slice = &buffer[data_start_offset..data_end_offset];
+    // --- Prepare Data (Slice, XOR, Chunking) ---
+    let data_result = prepare_data_for_decode(buffer, offset, header_len, length, magic_start, seq);
 
-    // --- Prepare Data (Apply XOR if needed, Handle Chunking) ---
-
-    // Determine if simple XOR is needed based on C code logic
-    let xor_key: u8 = match magic_start {
-        MAGIC_NO_COMPRESS_START | MAGIC_COMPRESS_START | MAGIC_COMPRESS_START1 => {
-            let key = BASE_XOR_KEY ^ (seq as u8) ^ magic_start;
-            log::trace!(
-                "Applying XOR key {:#04x} for magic {:#04x}",
-                key,
-                magic_start
-            );
-            key
-        }
-        _ => 0, // No simple XOR for other types
-    };
-
-    // Process data: might involve copying, chunk reassembly, and XORing.
-    // Result is owned Vec<u8> ready for decompression or use.
-    let data_result: Result<Vec<u8>, DecodeError> = match magic_start {
-        // Handle chunked format: Reassemble first, then XOR.
-        MAGIC_COMPRESS_START1 => {
-            let mut reassembled_data = Vec::with_capacity(length); // Initial guess
-            let mut current_pos = 0;
-            while current_pos < original_data_slice.len() {
-                // Need 2 bytes for chunk length
-                if current_pos + 2 > original_data_slice.len() {
-                    return Err(DecodeError::InvalidData(format!(
-                        "Incomplete chunk length at data offset {}",
-                        current_pos
-                    )));
-                }
-                // Read chunk length safely
-                let mut chunk_len_cursor =
-                    Cursor::new(&original_data_slice[current_pos..current_pos + 2]);
-                let chunk_len = chunk_len_cursor.read_u16::<LittleEndian>()? as usize;
-                current_pos += 2; // Advance past length field
-
-                let chunk_end = current_pos + chunk_len;
-                if chunk_end > original_data_slice.len() {
-                    return Err(DecodeError::InvalidData(format!(
-                        "Chunk length {} exceeds data slice bounds at data offset {}",
-                        chunk_len,
-                        current_pos - 2
-                    )));
-                }
-                // Append chunk data
-                reassembled_data.extend_from_slice(&original_data_slice[current_pos..chunk_end]);
-                current_pos = chunk_end; // Advance past chunk data
-            }
-            // Apply XOR *after* reassembly
-            if xor_key != 0 {
-                for byte in reassembled_data.iter_mut() {
-                    *byte ^= xor_key;
-                }
-            }
-            Ok(reassembled_data)
-        }
-        // For all other formats: Copy the data, then apply XOR if needed.
-        _ => {
-            let mut data_copy = original_data_slice.to_vec();
-            if xor_key != 0 {
-                for byte in data_copy.iter_mut() {
-                    *byte ^= xor_key;
-                }
-            }
-            Ok(data_copy)
-        }
-    }; // End data preparation
-
-    // Get the prepared data Vec<u8>, handling potential errors from chunking etc.
     let data_ready = match data_result {
         Ok(data) => data,
         Err(e) => {
-            let error_msg = format!(
-                "[!] decode_log_file: Failed preparing data for entry at offset {} (seq {}): {}\n",
-                current_offset, seq, e
-            );
-            out_buffer.extend_from_slice(error_msg.as_bytes());
-            log::error!("{}", error_msg.trim_end());
-            // Attempt to recover by skipping to the next theoretical entry position
-            let next_entry_offset = current_offset + header_len + length + 1;
-            return Ok(next_entry_offset);
+            // If data preparation (e.g., chunking) fails, log & skip.
+            log_and_append_error(&e, offset, seq, magic_start, out_buffer);
+            // Calculate next offset to skip this broken entry
+            let next_offset = offset + header_len + length + 1;
+            return Ok(next_offset);
         }
     };
 
-    // --- Decompression / Processing ---
-    // `data_ready` is the owned Vec<u8> after potential XORing and chunking.
-    let processing_outcome: Result<Vec<u8>, DecodeError> = match magic_start {
-        // --- No Compression ---
-        MAGIC_NO_COMPRESS_START            /* 0x03, XOR applied above */ |
-        MAGIC_NO_COMPRESS_START1           /* 0x06 */ |
-        MAGIC_NO_COMPRESS_NO_CRYPT_START   /* 0x08 */ => {
-             Ok(data_ready) // Data is already final (potentially after XOR)
-        }
+    // --- Decompression ---
+    let processing_outcome = decompress_data(&data_ready, magic_start, offset, seq);
 
-        // --- Raw Deflate ---
-        MAGIC_COMPRESS_START               /* 0x04, XOR + Raw Deflate */ |
-        MAGIC_COMPRESS_START1              /* 0x05, Chunked + XOR + Raw Deflate */ |
-        MAGIC_COMPRESS_NO_CRYPT_START      /* 0x09, Raw Deflate */ => {
-            if data_ready.is_empty() {
-                 Ok(Vec::new()) // Handle empty input
-            } else {
-                let mut decoder = DeflateDecoder::new(data_ready.as_slice());
-                let mut decompressed = Vec::with_capacity(data_ready.len() * 3); // Heuristic buffer size
-                // Use map_err to convert io::Error to DecodeError::Decompression
-                decoder.read_to_end(&mut decompressed)
-                    .map(|_| decompressed) // On success, return the decompressed Vec
-                    .map_err(|e| DecodeError::Decompression(e.to_string()))
-            }
-        }
-        // --- Raw Deflate (Encryption Skipped) ---
-         MAGIC_COMPRESS_START2 /* 0x07 */ => {
-            log::warn!("Entry at offset {} (seq {} magic {:#04x}) requires ECDH/TEA decryption (unsupported). Attempting raw DEFLATE on potentially encrypted data.", current_offset, seq, magic_start);
-            if data_ready.is_empty() { Ok(Vec::new()) } else {
-                let mut decoder = DeflateDecoder::new(data_ready.as_slice());
-                let mut decompressed = Vec::with_capacity(data_ready.len() * 3);
-                decoder.read_to_end(&mut decompressed)
-                    .map(|_| decompressed)
-                    .map_err(|e| DecodeError::Decompression(e.to_string()))
-            }
-        }
-
-        // --- Zstd (No Encryption) ---
-        MAGIC_ASYNC_NO_CRYPT_ZSTD_START  /* 0x0D */ |
-        MAGIC_SYNC_NO_CRYPT_ZSTD_START   /* 0x0B */ => {
-             zstd::decode_all(data_ready.as_slice())
-                .map_err(|e| DecodeError::Decompression(e.to_string()))
-        }
-        // --- Zstd (Encryption Skipped) ---
-        MAGIC_SYNC_ZSTD_START            /* 0x0A */ |
-         MAGIC_ASYNC_ZSTD_START          /* 0x0C */ => {
-            log::warn!("Entry at offset {} (seq {} magic {:#04x}) requires ECDH/TEA decryption (unsupported). Attempting ZSTD on potentially encrypted data.", current_offset, seq, magic_start);
-             zstd::decode_all(data_ready.as_slice())
-                .map_err(|e| DecodeError::Decompression(e.to_string()))
-         }
-
-        // Should not happen if get_crypt_key_len worked earlier
-        _ => Err(DecodeError::UnsupportedFormat(magic_start)),
-    }; // End match magic_start for decompression/processing
-
-    // --- Handle Processing Outcome ---
+    // --- Handle Outcome ---
     match processing_outcome {
         Ok(processed_data) => {
-            // Append successfully decoded data to the output buffer
             if !processed_data.is_empty() {
                 out_buffer.extend_from_slice(&processed_data);
             } else if length > 0 {
-                // Log if original data wasn't empty but result is
-                log::warn!("Processing entry at offset {} resulted in empty output (original data length: {}).", current_offset, length);
+                log::warn!("Processing entry at offset {} resulted in empty output (original data length: {}).", offset, length);
             }
         }
         Err(e) => {
-            // Log the error and append a message to the output file
-            let error_msg = format!( "[!] decode_log_file: Processing failed for entry at offset {} (seq {}, magic {:#04x}): {}\n", current_offset, seq, magic_start, e );
-            out_buffer.extend_from_slice(error_msg.as_bytes());
-            log::error!("{}", error_msg.trim_end());
-            // Recovery: Proceed to calculate next offset, effectively skipping failed entry's content.
+            log_and_append_error(&e, offset, seq, magic_start, out_buffer);
+            // Still proceed to calculate next offset below to skip entry
         }
     }
 
     // --- Calculate offset for the next entry ---
-    // This happens regardless of success/failure for the current entry.
-    // next_offset = current_entry_start + header_length + data_length + magic_end_byte(1)
-    let next_entry_offset = current_offset + header_len + length + 1;
+    let next_entry_offset = offset + header_len + length + 1;
     Ok(next_entry_offset)
 }
 
-// 添加一个处理单个文件的帮助函数，用于减少代码重复
-fn process_single_file(
-    input_path: &Path,
-    output_path: &Path,
-    final_result: &mut Result<(), Box<dyn std::error::Error>>,
+// --- Sub-functions for decode_single_entry ---
+
+/// Validates header at offset and extracts key fields.
+fn validate_and_parse_header(
+    buffer: &[u8],
+    offset: usize,
+) -> Result<(usize, u16, usize, u8), String> {
+    if offset >= buffer.len() {
+        return Err("Offset >= buffer length".to_string());
+    }
+
+    let magic_start = buffer[offset];
+    let crypt_key_len = get_crypt_key_len(magic_start)
+        .ok_or_else(|| format!("Invalid magic byte {:#04x}", magic_start))?;
+    let header_len = 1 + 2 + 1 + 1 + 4 + crypt_key_len;
+
+    if offset + header_len > buffer.len() {
+        return Err(format!(
+            "Buffer too small for header (needs {}, have {})",
+            header_len,
+            buffer.len() - offset
+        ));
+    }
+
+    // Use check_log_header logic implicitly by checking its return value
+    check_log_header(buffer, offset)?; // If this passes, structure is OK
+
+    // Parse fields now that structure is validated
+    let mut cursor = Cursor::new(&buffer[offset + 1..offset + header_len]); // Skip magic
+    let seq = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| e.to_string())?;
+    let _begin_hour = cursor.read_u8().map_err(|e| e.to_string())?;
+    let _end_hour = cursor.read_u8().map_err(|e| e.to_string())?;
+    let length = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| e.to_string())? as usize;
+
+    Ok((header_len, seq, length, magic_start))
+}
+
+/// Checks for gaps in log sequence numbers.
+fn check_sequence_gap(seq: u16, last_seq: &mut u16, out_buffer: &mut Vec<u8>) {
+    if seq > 1 && *last_seq != 0 && seq != (*last_seq + 1) {
+        let expected = *last_seq + 1;
+        let missing_end = seq - 1;
+        let warning = format!(
+            "[!] Sequence gap: Expected {}, got {}. Missing: {}-{}\n",
+            expected, seq, expected, missing_end
+        );
+        out_buffer.extend_from_slice(warning.as_bytes());
+        log::warn!("{}", warning.trim_end());
+    }
+    if seq != 0 {
+        *last_seq = seq;
+    }
+}
+
+/// Extracts data slice, applies XOR, handles chunking.
+fn prepare_data_for_decode(
+    buffer: &[u8],
+    offset: usize,
+    header_len: usize,
+    length: usize,
+    magic_start: u8,
+    seq: u16,
+) -> Result<Vec<u8>, DecodeError> {
+    let data_start = offset + header_len;
+    let data_end = data_start + length;
+    if data_end > buffer.len() {
+        return Err(DecodeError::InvalidData(format!(
+            "Data range [{}:{}) exceeds buffer len {}",
+            data_start,
+            data_end,
+            buffer.len()
+        )));
+    }
+    let original_data_slice = &buffer[data_start..data_end];
+
+    // --- Simple XOR ---
+    let xor_key = match magic_start {
+        MAGIC_NO_COMPRESS_START | MAGIC_COMPRESS_START | MAGIC_COMPRESS_START1 => {
+            let key = BASE_XOR_KEY ^ (seq as u8) ^ magic_start;
+            log::trace!("Applying XOR key {:#04x}", key);
+            key
+        }
+        _ => 0,
+    };
+
+    // --- Chunking & XOR ---
+    let mut data_ready = match magic_start {
+        MAGIC_COMPRESS_START1 => {
+            // Chunked format
+            let mut reassembled = Vec::with_capacity(length);
+            let mut current_pos = 0;
+            while current_pos < original_data_slice.len() {
+                if current_pos + 2 > original_data_slice.len() {
+                    return Err(DecodeError::InvalidData(
+                        "Incomplete chunk length".to_string(),
+                    ));
+                }
+                let chunk_len = Cursor::new(&original_data_slice[current_pos..current_pos + 2])
+                    .read_u16::<LittleEndian>()? as usize;
+                current_pos += 2;
+                let chunk_end = current_pos + chunk_len;
+                if chunk_end > original_data_slice.len() {
+                    return Err(DecodeError::InvalidData(format!(
+                        "Chunk len {} exceeds data bounds",
+                        chunk_len
+                    )));
+                }
+                reassembled.extend_from_slice(&original_data_slice[current_pos..chunk_end]);
+                current_pos = chunk_end;
+            }
+            reassembled // XOR will be applied below
+        }
+        _ => original_data_slice.to_vec(), // Other formats: just copy
+    };
+
+    // Apply XOR if needed (works on both reassembled and copied data)
+    if xor_key != 0 {
+        for byte in data_ready.iter_mut() {
+            *byte ^= xor_key;
+        }
+    }
+
+    Ok(data_ready)
+}
+
+/// Performs decompression based on magic byte.
+fn decompress_data(
+    data_ready: &[u8],
+    magic_start: u8,
+    offset: usize,
+    seq: u16,
+) -> Result<Vec<u8>, DecodeError> {
+    match magic_start {
+        // No Compression
+        MAGIC_NO_COMPRESS_START | MAGIC_NO_COMPRESS_START1 | MAGIC_NO_COMPRESS_NO_CRYPT_START => {
+            Ok(data_ready.to_vec()) // Return owned vec
+        }
+        // Raw Deflate
+        MAGIC_COMPRESS_START | MAGIC_COMPRESS_START1 | MAGIC_COMPRESS_NO_CRYPT_START => {
+            if data_ready.is_empty() {
+                Ok(Vec::new())
+            } else {
+                let mut decoder = DeflateDecoder::new(data_ready);
+                // Create the buffer first
+                let mut decompressed = Vec::with_capacity(data_ready.len() * 3);
+                // Read into the buffer, map error, then return the buffer on success
+                decoder
+                    .read_to_end(&mut decompressed)
+                    .map(|_| decompressed) // On Ok(usize), return Ok(decompressed Vec)
+                    .map_err(DecodeError::Decompression)
+            }
+        }
+        // Raw Deflate (Encrypted) - FIX HERE
+        MAGIC_COMPRESS_START2 => {
+            log::warn!("Entry at offset {} (seq {}, magic {:#04x}) needs ECDH/TEA decryption (unsupported). Attempting raw DEFLATE.", offset, seq, magic_start);
+            if data_ready.is_empty() {
+                Ok(Vec::new())
+            } else {
+                let mut decoder = DeflateDecoder::new(data_ready);
+                // Create the buffer first
+                let mut decompressed = Vec::with_capacity(data_ready.len() * 3);
+                // Read into the buffer, map error, then return the buffer on success
+                decoder
+                    .read_to_end(&mut decompressed)
+                    .map(|_| decompressed) // <-- Add this map step
+                    .map_err(DecodeError::Decompression)
+            }
+        }
+        // Zstd (No Crypt)
+        MAGIC_ASYNC_NO_CRYPT_ZSTD_START | MAGIC_SYNC_NO_CRYPT_ZSTD_START => {
+            zstd::decode_all(data_ready).map_err(DecodeError::Decompression)
+        }
+        // Zstd (Encrypted)
+        MAGIC_SYNC_ZSTD_START | MAGIC_ASYNC_ZSTD_START => {
+            log::warn!("Entry at offset {} (seq {}, magic {:#04x}) requires ECDH/TEA decryption (unsupported). Attempting ZSTD.", offset, seq, magic_start);
+            zstd::decode_all(data_ready).map_err(DecodeError::Decompression)
+        }
+        _ => Err(DecodeError::UnsupportedFormat(magic_start)),
+    }
+}
+
+/// Logs an error and appends a message to the output buffer.
+fn log_and_append_error(
+    e: &DecodeError,
+    offset: usize,
+    seq: u16,
+    magic_start: u8,
+    out_buffer: &mut Vec<u8>,
 ) {
-    if let Err(e) = parse_file(input_path, output_path) {
-        log::error!("Error processing {}: {}", input_path.display(), e);
-        if final_result.is_ok() {
-            *final_result = Err(format!("Failed on {}: {}", input_path.display(), e).into());
-        }
-    }
-}
-
-// 添加一个处理目录中所有xlog文件的帮助函数
-fn process_directory(
-    dir_path: &Path,
-    final_result: &mut Result<(), Box<dyn std::error::Error>>,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let pattern = dir_path.join("*.xlog");
-    let pattern_str = pattern
-        .to_str()
-        .ok_or_else(|| "Invalid input directory path encoding.".to_string())?;
-
-    log::info!("Searching for files matching: {}", pattern_str);
-    let mut files_found = false;
-
-    for entry in glob(pattern_str)? {
-        match entry {
-            Ok(xlog_path) => {
-                if xlog_path.is_file() {
-                    files_found = true;
-                    let mut log_path = xlog_path.clone();
-                    log_path.set_extension("log");
-                    log::debug!(
-                        "Processing {:?} -> {:?}",
-                        xlog_path.display(),
-                        log_path.display()
-                    );
-                    process_single_file(&xlog_path, &log_path, final_result);
-                }
-            }
-            Err(e) => {
-                log::error!("Error accessing file during glob search: {}", e);
-                if final_result.is_ok() {
-                    *final_result = Err(e.into());
-                }
-            }
-        }
-    }
-
-    Ok(files_found)
-}
-
-// 优化后的parse_file函数
-fn parse_file(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
-    log::info!(
-        "Decoding {:?} to {:?}",
-        input_path.display(),
-        output_path.display()
+    let error_msg = format!(
+        "[!] Failed entry offset={}, seq={}, magic={:#04x}: {}\n",
+        offset, seq, magic_start, e
     );
+    out_buffer.extend_from_slice(error_msg.as_bytes());
+    log::error!("{}", error_msg.trim_end());
+}
 
-    // 读取xlog文件内容
-    let buffer = fs::read(input_path).map_err(DecodeError::Io)?;
+/// Tries to find the start of the next valid entry after a failure.
+fn find_next_valid_entry_start(
+    buffer: &[u8],
+    failed_offset: usize,
+    out_buffer: &mut Vec<u8>,
+) -> Result<usize, DecodeError> {
+    let search_start = failed_offset + 1;
+    if search_start >= buffer.len() {
+        return Err(DecodeError::NotFound);
+    }
+
+    match find_log_start_pos(&buffer[search_start..], 1) {
+        Some(relative_offset) => {
+            let absolute_offset = search_start + relative_offset;
+            let skipped_bytes = absolute_offset - failed_offset;
+            let warning = format!(
+                "[!] Skipped {} potentially corrupt bytes after offset {}.\n",
+                skipped_bytes, failed_offset
+            );
+            out_buffer.extend_from_slice(warning.as_bytes());
+            log::warn!("{}", warning.trim_end());
+            Ok(absolute_offset) // Return the offset of the next valid entry
+        }
+        None => Err(DecodeError::NotFound), // No more valid entries found after this point
+    }
+}
+
+/// Parses a single xlog file, handles decoding loop and output writing.
+fn parse_file(input_path: &Path, output_path: &Path) -> Result<(), DecodeError> {
+    log::info!("Processing {}", input_path.display());
+    let buffer = fs::read(input_path)?; // Propagates io::Error
 
     if buffer.is_empty() {
-        log::warn!("Skipping empty file: {:?}", input_path.display());
+        log::warn!("Input file is empty: {}", input_path.display());
+        File::create(output_path)?; // Create empty output
         return Ok(());
     }
 
-    // 寻找有效日志的起始位置
-    let start_offset = find_log_start_pos(&buffer, 3).ok_or_else(|| {
-        DecodeError::Format(format!(
-            "Could not find valid log entries in {:?}",
-            input_path
-        ))
-    })?;
+    // --- Find Initial Start ---
+    let initial_offset = match find_log_start_pos(&buffer, 2) {
+        // Prefer 2 consecutive
+        Some(offset) => offset,
+        None => find_log_start_pos(&buffer, 1) // Fallback to 1
+            .ok_or_else(|| {
+                log::error!("No valid log entries found in {}", input_path.display());
+                // Create empty file on total failure before returning error
+                if let Err(e) = File::create(output_path) {
+                    log::error!(
+                        "Failed to create empty output file {}: {}",
+                        output_path.display(),
+                        e
+                    );
+                }
+                DecodeError::NotFound
+            })?,
+    };
 
-    if start_offset > 0 {
-        log::debug!(
-            "Skipped {} bytes before finding valid log entries",
-            start_offset
+    if initial_offset > 0 {
+        log::warn!(
+            "Skipping first {} bytes, starting decode at offset {}.",
+            initial_offset,
+            initial_offset
         );
     }
 
-    // 解码日志内容
-    let mut out_buffer = Vec::with_capacity(buffer.len() * 2); // 预分配足够空间，避免频繁重新分配
-    let mut offset = start_offset;
+    // --- Decoding Loop ---
+    let mut out_buffer = Vec::with_capacity(buffer.len() * 2); // Heuristic preallocation
     let mut last_seq = 0u16;
+    let mut current_offset = initial_offset;
 
-    while offset < buffer.len() {
-        match decode_buffer(&buffer, offset, &mut out_buffer, &mut last_seq) {
+    while current_offset < buffer.len() {
+        match decode_single_entry(&buffer, current_offset, &mut out_buffer, &mut last_seq) {
             Ok(next_offset) => {
-                offset = next_offset;
+                if next_offset <= current_offset {
+                    // Should ideally not happen with new structure
+                    log::error!(
+                        "Decode loop stalled: offset {} -> {}. Aborting file.",
+                        current_offset,
+                        next_offset
+                    );
+                    out_buffer.extend_from_slice(b"[!] Internal Error: Decode loop stalled.\n");
+                    break;
+                }
+                current_offset = next_offset;
+            }
+            Err(DecodeError::NotFound) => {
+                log::info!(
+                    "Stopped processing near offset {}: End of valid data.",
+                    current_offset
+                );
+                break; // Normal end condition when recovery fails
             }
             Err(e) => {
-                // 出错时尝试恢复，寻找下一个有效的日志开始位置
-                log::warn!("Decode error at offset {}: {}", offset, e);
-                match find_log_start_pos(&buffer[offset.min(buffer.len() - 1)..], 2) {
-                    Some(new_rel_offset) => {
-                        let new_offset = offset + new_rel_offset;
-                        log::debug!(
-                            "Found next valid log section at offset {} (skipped {} bytes)",
-                            new_offset,
-                            new_rel_offset
-                        );
-                        offset = new_offset;
-                    }
-                    None => {
-                        log::debug!("No more valid log entries found after offset {}", offset);
-                        break;
-                    }
-                }
+                // Should be less common now as decode_single_entry tries to return Ok on failure
+                log::error!(
+                    "Unexpected error in decode loop at {}: {}. Aborting file.",
+                    current_offset,
+                    e
+                );
+                let error_msg = format!("[!] Unexpected Loop Error: {}. Aborting.\n", e);
+                out_buffer.extend_from_slice(error_msg.as_bytes());
+                break;
             }
         }
-    }
+    } // End while loop
 
-    // 检查是否成功解码了内容
-    if out_buffer.is_empty() {
+    // --- Write Output ---
+    if out_buffer.is_empty() && initial_offset == 0 && buffer.len() > 0 {
         log::warn!(
-            "Processing completed, but no log content was successfully decoded for: {:?}",
+            "Processing completed, but no log content was successfully decoded for: {}",
             input_path.display()
         );
-    } else {
-        log::info!(
-            "Writing decoded log content ({} bytes) to: {:?}",
-            out_buffer.len(),
-            output_path.display()
-        );
     }
+    log::info!(
+        "Writing {} bytes to {}",
+        out_buffer.len(),
+        output_path.display()
+    );
 
-    // 确保输出目录存在
     if let Some(parent) = output_path.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent).map_err(DecodeError::Io)?;
-        }
+        // Ensure output dir exists
+        fs::create_dir_all(parent)?;
     }
-
-    // 写入输出文件
-    fs::write(output_path, &out_buffer).map_err(DecodeError::Io)?;
+    fs::write(output_path, &out_buffer)?; // Write content
 
     Ok(())
 }
 
 // --- Command Line Interface ---
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Decodes WeChat XLog files using various compression/XOR schemes.", long_about = None)]
+#[command(author, version, about = "Decodes XLog files (Rust Port)", long_about = None)]
 struct Cli {
-    /// Input .xlog file or directory containing .xlog files.
-    /// If a directory, all .xlog files within will be processed.
-    /// If omitted, searches for .xlog files in the current directory.
     #[arg()]
     input: Option<PathBuf>,
-
-    /// Output .log file path.
-    /// If input is a file, this specifies the exact output path.
-    /// If input is a directory or omitted, this argument is ignored,
-    /// and output files are created adjacent to inputs with a .log extension.
-    /// Cannot be a directory.
     #[arg()]
     output: Option<PathBuf>,
 }
 
-// --- Main Execution ---
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化日志（读取RUST_LOG环境变量，默认为info级别）
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+// --- Main Execution & Argument Handling Helpers ---
 
+/// Processes a single input file to the specified output file.
+fn process_single_file(
+    input: &Path,
+    output: &Path,
+    first_error: &mut Option<Box<dyn std::error::Error>>,
+) {
+    if let Err(e) = parse_file(input, output) {
+        log::error!("Failed processing {}: {}", input.display(), e);
+        if first_error.is_none() {
+            *first_error = Some(format!("Failed on {}: {}", input.display(), e).into());
+        }
+    }
+}
+
+/// Processes all *.xlog files in a given directory.
+fn process_directory(
+    dir: &Path,
+    first_error: &mut Option<Box<dyn std::error::Error>>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let pattern = dir.join("*.xlog");
+    let pattern_str = pattern.to_str().ok_or("Invalid directory path encoding")?;
+    log::info!("Searching for files matching: {}", pattern_str);
+    let mut found_files = false;
+
+    for entry in glob(pattern_str)? {
+        match entry {
+            Ok(xlog_path) => {
+                if xlog_path.is_file() {
+                    found_files = true;
+                    let mut log_path = xlog_path.clone();
+                    log_path.set_extension("log");
+                    log::debug!("Queueing {} -> {}", xlog_path.display(), log_path.display());
+                    process_single_file(&xlog_path, &log_path, first_error);
+                }
+            }
+            Err(e) => {
+                log::error!("Error accessing file during glob search: {}", e);
+                if first_error.is_none() {
+                    *first_error = Some(e.into());
+                }
+            }
+        }
+    }
+    Ok(found_files)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
-    let mut final_result: Result<(), Box<dyn std::error::Error>> = Ok(());
+    let mut first_error: Option<Box<dyn std::error::Error>> = None;
 
     match (cli.input.as_ref(), cli.output.as_ref()) {
-        // 情况1: 指定输入文件和输出文件
-        (Some(input_path), Some(output_path)) => {
-            if input_path.is_dir() {
-                return Err(
-                    "Input path cannot be a directory when a specific output path is given.".into(),
-                );
+        // Case 1: Input File and Output File
+        (Some(input), Some(output)) => {
+            if input.is_dir() {
+                return Err("Input cannot be directory when output is specified.".into());
             }
-            if output_path.is_dir() {
+            if output.is_dir() {
                 return Err("Output path cannot be a directory.".into());
             }
-
-            // 确保输出目录存在
-            if let Some(parent) = output_path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)?;
-                    log::info!("Created output directory: {:?}", parent.display());
-                }
-            }
-
-            process_single_file(input_path, output_path, &mut final_result);
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            } // Ensure output dir exists
+            process_single_file(input, output, &mut first_error);
         }
-
-        // 情况2: 指定输入（文件或目录），默认输出
-        (Some(input_path), None) => {
-            if input_path.is_dir() {
-                // 处理输入目录中所有的.xlog文件
-                let files_found = process_directory(input_path, &mut final_result)?;
-
-                if !files_found {
-                    log::warn!(
-                        "No .xlog files found in directory: {:?}",
-                        input_path.display()
-                    );
+        // Case 2: Input (File or Dir), Default Output Name(s)
+        (Some(input), None) => {
+            if input.is_dir() {
+                let found = process_directory(input, &mut first_error)?;
+                if !found {
+                    log::warn!("No *.xlog files found in directory: {}", input.display());
                 }
             } else {
-                // 输入是单个文件，使用默认输出名称
-                if !input_path.exists() {
-                    return Err(format!("Input file not found: {}", input_path.display()).into());
+                // Input is file
+                if !input.exists() {
+                    return Err(format!("Input file not found: {}", input.display()).into());
                 }
-                let mut log_path = input_path.clone();
-                log_path.set_extension("log"); // 输出到输入旁边
-                process_single_file(input_path, &log_path, &mut final_result);
+                let mut output = input.clone();
+                output.set_extension("log");
+                process_single_file(input, &output, &mut first_error);
             }
         }
-
-        // 情况3: 未指定输入（使用当前目录），默认输出
+        // Case 3: No Input (Current Dir), Default Output Names
         (None, None) => {
             let current_dir = std::env::current_dir()?;
-            log::info!("No input specified. Searching for '*.xlog' in current directory.");
-
-            let files_found = process_directory(&current_dir, &mut final_result)?;
-
-            if !files_found {
-                log::warn!("No .xlog files found in current directory");
+            log::info!(
+                "No input specified, searching current directory: {}",
+                current_dir.display()
+            );
+            let found = process_directory(&current_dir, &mut first_error)?;
+            if !found {
+                log::warn!("No *.xlog files found in current directory.");
             }
         }
-
-        // 情况4: 未指定输入但指定了输出（无效情况）
+        // Case 4: No Input, Output Specified (Invalid)
         (None, Some(_)) => {
             return Err("Cannot specify output file without specifying input file.".into());
         }
     }
 
-    final_result
+    // Return first error encountered, or Ok
+    match first_error {
+        Some(err) => {
+            log::error!("Processing finished with errors.");
+            Err(err)
+        }
+        None => {
+            log::info!("Processing finished successfully.");
+            Ok(())
+        }
+    }
 }
