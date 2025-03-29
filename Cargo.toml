@@ -1,0 +1,21 @@
+[package]
+name = "xloge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+byteorder = "1.5" # For reading binary data (like struct.unpack)
+flate2 = { version = "1.0", default-features = false, features = ["zlib"] }
+zstd = "0.13" # For zstd decompression
+glob = "0.3" # For finding files matching a pattern
+clap = { version = "4.5", features = [
+    "derive",
+] } # Optional: For better argument parsing
+thiserror = "1.0" # For defining custom error types
+log = "0.4" # For logging
+env_logger = "0.10" # For logging
+
+[profile.release]
+lto = true
+opt-level = "z"
+codegen-units = 1
