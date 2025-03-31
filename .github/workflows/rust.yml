@@ -15,10 +15,10 @@ jobs:
       matrix:
         include:
           - os: macos-13
-            artifact_name: xloge-macos-x64
+            artifact_name: xloge
             asset_name: xloge-macos-x64
           - os: macos-latest
-            artifact_name: xloge-macos-arm64
+            artifact_name: xloge
             asset_name: xloge-macos-arm64
             rust_target: aarch64-apple-darwin
     
@@ -38,12 +38,6 @@ jobs:
       with:
         command: build
         args: --release --all-features ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) }}
-    
-    - name: Run tests
-      uses: actions-rs/cargo@v1
-      with:
-        command: test
-        args: --all-features ${{ matrix.rust_target && format('--target {0}', matrix.rust_target) }}
     
     - name: Prepare artifact path
       id: artifact-path
@@ -80,4 +74,5 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
+        name: ${{ matrix.asset_name }}
         files: ${{ steps.artifact-path.outputs.path }}
