@@ -15,10 +15,10 @@ jobs:
       matrix:
         include:
           - os: macos-13
-            artifact_name: xloge
+            artifact_name: xloge-macos-x64
             asset_name: xloge-macos-x64
           - os: macos-latest
-            artifact_name: xloge
+            artifact_name: xloge-macos-arm64
             asset_name: xloge-macos-arm64
             rust_target: aarch64-apple-darwin
     
