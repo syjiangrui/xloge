@@ -48,16 +48,22 @@ jobs:
           echo "path=target/release/${{ matrix.artifact_name }}" >> $GITHUB_OUTPUT
         fi
         
-    - name: Rename binary
+    - name: Prepare and compress binary
       run: |
+        # Copy the binary
         cp ${{ steps.artifact-path.outputs.path }} ${{ matrix.asset_name }}
+        
+        # Make it executable
         chmod +x ${{ matrix.asset_name }}
+        
+        # Compress as tar.gz to preserve permissions
+        tar -czf ${{ matrix.asset_name }}.tar.gz ${{ matrix.asset_name }}
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.asset_name }}
-        path: ${{ matrix.asset_name }}
+        path: ${{ matrix.asset_name }}.tar.gz
         retention-days: 5
 
   release:
@@ -73,7 +79,7 @@ jobs:
       
       - name: List files
         run: |
-          find . -type f -executable
+          find . -type f
           
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
@@ -84,5 +90,5 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            ./xloge-macos-x64/xloge-macos-x64
-            ./xloge-macos-arm64/xloge-macos-arm64
+            ./xloge-macos-x64/xloge-macos-x64.tar.gz
+            ./xloge-macos-arm64/xloge-macos-arm64.tar.gz
